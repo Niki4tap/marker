@@ -8,6 +8,8 @@ use marker_api::{
     lint::Lint,
 };
 
+use crate::loader::{LintId, LINT_REGISTRY};
+
 /// ### Safety
 ///
 /// `&dyn` objects are theoretically not FFI safe since their type layout can
@@ -56,8 +58,17 @@ extern "C" fn body<'ast>(data: &(), id: BodyId) -> &'ast Body<'ast> {
 }
 
 extern "C" fn emit_lint(data: &(), lint: &'static Lint, msg: ffi::Str, span: &Span<'_>) {
+    let lint_id = LintId::of(lint);
+    let patched_lint = LINT_REGISTRY.with(|registry| {
+        registry
+            .borrow_mut()
+            .as_mut()
+            .expect("Lint crate registry was not set when linting")
+            .get_patched_lint(lint_id)
+    });
+
     let wrapper = unsafe { &*(data as *const ()).cast::<DriverContextWrapper>() };
-    wrapper.driver_cx.emit_lint(lint, (&msg).into(), span);
+    wrapper.driver_cx.emit_lint(patched_lint, (&msg).into(), span);
 }
 
 extern "C" fn get_span<'ast>(data: &(), owner: &SpanOwner) -> &'ast Span<'ast> {

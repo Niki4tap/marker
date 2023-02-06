@@ -4,7 +4,7 @@ warning: a function named `foo`, consider using a more meaningful name
 2 |     fn foo() {}
   |     ^^^^^^^^^^^
   |
-  = note: `#[warn(marker::foo_items)]` on by default
+  = note: `#[warn(marker_lints::foo_items)]` on by default
 
 warning: a static item named `foo`, consider using a more meaningful name
  --> $DIR/foo_items.rs:4:5

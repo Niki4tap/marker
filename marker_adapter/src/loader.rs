@@ -5,7 +5,18 @@ use marker_api::context::AstContext;
 use marker_api::lint::Lint;
 use marker_api::LintPass;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::hash::{Hash, Hasher};
+
+thread_local! {
+    /// **Warning**
+    ///
+    /// Lifetimes are obviously fake here
+    #[doc(hidden)]
+    pub(super) static LINT_REGISTRY: RefCell<Option<&'static mut LintCrateRegistry<'static>>> = RefCell::new(None);
+}
 
 /// Splits [`OsStr`] by an ascii character
 // This *maybe* works on windows, and *maybe* works on unix, I'm giving no guarantees here
@@ -45,11 +56,42 @@ fn windows_split_os_str(s: &OsStr, c: u8) -> Vec<OsString> {
         .collect()
 }
 
+/// <https://doc.rust-lang.org/stable/nightly-rustc/rustc_lint/struct.LintId.html>
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LintId {
+    pub lint: &'static Lint,
+}
+
+impl LintId {
+    pub(super) fn of(lint: &'static Lint) -> LintId {
+        LintId { lint }
+    }
+}
+
+impl PartialEq for LintId {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.lint, other.lint)
+    }
+}
+
+impl Eq for LintId {}
+
+impl Hash for LintId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let ptr = self.lint as *const Lint;
+        ptr.hash(state);
+    }
+}
+
 /// This struct loads external lint crates into memory and provides a safe API
 /// to call the respective methods on all of them.
 #[derive(Default)]
 pub struct LintCrateRegistry<'ast> {
     passes: Vec<LoadedLintCrate<'ast>>,
+    /// This monkey-patches lints at runtime, currently only to support lint renaming, but might be
+    /// used in the future for other purposes
+    patched_lint_store: HashMap<LintId, &'static Lint>,
+    expected_lint: Option<usize>,
 }
 
 impl<'ast> LintCrateRegistry<'ast> {
@@ -99,6 +141,32 @@ impl<'ast> LintCrateRegistry<'ast> {
         new_self
     }
 
+    fn patch_lint(lint: LintId, name: &str) -> &'static Lint {
+        Box::leak(Box::new(Lint {
+            name: Box::leak(format!("{name}::{}", lint.lint.name).into_boxed_str()),
+            ..*lint.lint
+        }))
+    }
+
+    fn get_expected_lint(&mut self) -> &LoadedLintCrate {
+        &self.passes[self
+            .expected_lint
+            .expect("`expected_lint` was `None` during linting, this should never happen")]
+    }
+
+    pub(super) fn get_patched_lint(&mut self, lint: LintId) -> &'static Lint {
+        if self.patched_lint_store.contains_key(&lint) {
+            return self.patched_lint_store[&lint];
+        }
+
+        let new_name = &self.get_expected_lint().name;
+        let patched = Self::patch_lint(lint, new_name);
+
+        self.patched_lint_store.insert(lint, patched);
+
+        patched
+    }
+
     pub(super) fn set_ast_context(&self, cx: &'ast AstContext<'ast>) {
         for lint_pass in &self.passes {
             lint_pass.set_ast_context(cx);
@@ -125,7 +193,12 @@ macro_rules! gen_lint_crate_reg_lint_pass_fn {
     };
     (fn $fn_name:ident<'ast>(&(mut) self $(, $arg_name:ident: $arg_ty:ty)*) -> ()) => {
         fn $fn_name<'ast>(&mut self $(, $arg_name: $arg_ty)*) {
-            for lint_pass in self.passes.iter_mut() {
+            let passes = self.passes.clone();
+            // This is probably wildly unsafe, I really don't like this, but I'm also really not sure how to avoid it
+            LINT_REGISTRY.with(|v| v.replace(Some(unsafe {core::mem::transmute(self)})));
+
+            for (idx, lint_pass) in passes.iter().enumerate() {
+                LINT_REGISTRY.with(|v| v.borrow_mut().as_mut().unwrap().expected_lint = Some(idx));
                 lint_pass.$fn_name($($arg_name, )*);
             }
         }
