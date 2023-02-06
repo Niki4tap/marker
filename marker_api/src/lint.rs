@@ -120,7 +120,7 @@ macro_rules! declare_lint {
     ) => {
         $(#[$attr])*
         pub static $NAME: &$crate::lint::Lint = &$crate::lint::Lint {
-            name: concat!("marker::", stringify!($NAME)),
+            name: stringify!($NAME),
             default_level: $crate::lint::Level::$LEVEL,
             explaination: $EXPLAINATION,
             report_in_macro: $REPORT_IN_MACRO,

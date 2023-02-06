@@ -7,21 +7,15 @@ mod config;
 mod driver;
 mod lints;
 
-use std::{
-    ffi::{OsStr, OsString},
-    fs::create_dir_all,
-    io,
-    path::Path,
-    process::exit,
-};
+use std::{ffi::OsString, fs::create_dir_all, io, path::Path, process::exit};
 
 use cli::get_clap_config;
 use config::Config;
 use driver::{get_driver_path, run_driver};
-use lints::LintCrateSpec;
+use lints::{LintCrateSpec, PackageName};
 use once_cell::sync::Lazy;
 
-use crate::driver::print_driver_version;
+use crate::{driver::print_driver_version, lints::build_all};
 
 const CARGO_ARGS_SEPARATOR: &str = "--";
 const VERSION: &str = concat!("cargo-marker ", env!("CARGO_PKG_VERSION"));
@@ -89,7 +83,17 @@ fn choose_lint_crates<'a>(
     config: Option<&'a Config>,
 ) -> Result<Vec<LintCrateSpec<'a>>, ExitStatus> {
     match args.get_many::<OsString>("lints") {
-        Some(v) => Ok(v.map(|v| LintCrateSpec::new(None, v.as_ref())).collect()),
+        Some(v) => v
+            .map(|v| {
+                let Some(file_name) = Path::new(v).file_name() else {
+                return Err(ExitStatus::InvalidValue);
+            };
+                Ok(LintCrateSpec::new(
+                    PackageName::Named(file_name.to_string_lossy()),
+                    v.as_ref(),
+                ))
+            })
+            .collect(),
         None => {
             if let Some(config) = config {
                 config.collect_crates()
@@ -165,20 +169,15 @@ fn run_check(
         return Err(ExitStatus::InvalidValue);
     }
 
-    let mut lint_crates = Vec::with_capacity(crate_entries.len());
-
     println!();
     println!("Compiling Lints:");
     let target_dir = Path::new(&*MARKER_LINT_DIR);
-    for krate in crate_entries {
-        let crate_file = krate.build(target_dir, verbose)?;
-        lint_crates.push(crate_file.as_os_str().to_os_string());
-    }
+    let env = build_all(crate_entries, target_dir, verbose)?;
 
     #[rustfmt::skip]
     let env = vec![
         (OsString::from("RUSTC_WORKSPACE_WRAPPER"), get_driver_path().as_os_str().to_os_string()),
-        (OsString::from("MARKER_LINT_CRATES"), lint_crates.join(OsStr::new(";")))
+        (OsString::from("MARKER_LINT_CRATES"), env)
     ];
     if test_build {
         print_env(env).unwrap();

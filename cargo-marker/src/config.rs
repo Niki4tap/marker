@@ -8,7 +8,10 @@ use serde::Deserialize;
 
 use toml_edit::easy::{from_str, Value};
 
-use crate::{lints::LintCrateSpec, ExitStatus};
+use crate::{
+    lints::{LintCrateSpec, PackageName},
+    ExitStatus,
+};
 
 const CARGO_TOML: &str = "Cargo.toml";
 
@@ -146,9 +149,15 @@ impl Config {
                     );
                     if let Some(ref path) = dep.path {
                         if let Some(ref package) = dep.package {
-                            return Ok(LintCrateSpec::new(Some(package), path.as_ref()));
+                            return Ok(LintCrateSpec::new(
+                                PackageName::Renamed {
+                                    original: package.into(),
+                                    new: name.into(),
+                                },
+                                path.as_ref(),
+                            ));
                         }
-                        return Ok(LintCrateSpec::new(Some(name), path.as_ref()));
+                        return Ok(LintCrateSpec::new(PackageName::Named(name.into()), path.as_ref()));
                     }
                     eprintln!("No `path` field found for lint crate {name}");
                     Err(ExitStatus::BadConfiguration)

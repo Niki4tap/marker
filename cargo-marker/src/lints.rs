@@ -1,49 +1,113 @@
 use std::{
-    ffi::OsStr,
+    borrow::Cow,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::Command,
 };
 
 use crate::ExitStatus;
 
-pub struct LintCrateSpec<'a> {
-    /// Optional package name (this is always UTF-8, as opposed to `dir`), exists if supplied from
-    /// config:
-    ///
+/// Package name of a lint crate.
+///
+/// In case of `Cargo.toml` configuration, can be either:
+/// - [`PackageName::Renamed`] with `package` option,
+/// - or, simply [`PackageName::Named`]
+/// according to the example below:
+///
+/// ```toml
+/// lint_a = { path = "..." }
+/// # PackageName::Named("lint_a")
+///
+/// lint_b = { path = "..", package = "lint_c"}
+/// # PackageName::Renamed {
+/// #     original: "lint_c",
+/// #     new:  "lint_b"
+/// # }
+/// ```
+///
+/// If the lint crate was supplied only from path, this is going to be [`PackageName::Named`]
+/// with the package name being the directory name, for example in
+/// case of command-line arguments:
+///
+/// `--lints ./marker_lints`
+/// This will result in `PackageName::Named("marker_lints")`
+#[derive(Debug, Clone)]
+pub enum PackageName<'a> {
+    /// The lint crate was renamed
     /// ```toml
-    /// lint_a = { path = "" }
-    /// # `lint_a` is the package_name
-    /// lint_b = { path = "", package = "lint_c"}
-    /// # `lint_c` is the package name
+    /// lint_b = { path = "...", package = "lint_c"}
+    /// # PackageName::Renamed {
+    /// #     original: "lint_c",
+    /// #     new: "lint_b"
+    /// # }
     /// ```
-    /// if the lint crate was supplied only from path, this is `None`, for example in case of
-    /// command-line arguments:
-    ///
-    /// `--lints ./marker_lints`
-    ///
-    /// where `./marker_lints` is `dir`, and `package_name` in this case is empty.
-    ///
-    /// Setting this to `None` won't validate the package name when building the package with
-    /// [`build()`](`Self::build`)
-    package_name: Option<&'a str>,
+    Renamed { original: Cow<'a, str>, new: Cow<'a, str> },
+    /// The lint crate wasn't renamed
+    /// ```toml
+    /// lint_a = { path = "..." }
+    /// # PackageName::Named("lint_a")
+    /// ```
+    Named(Cow<'a, str>),
+}
+
+impl PackageName<'_> {
+    /// Passes necessary flags to `cargo` during lint crate build
+    pub fn cargo_args(&self, cmd: &mut Command) {
+        match self {
+            PackageName::Renamed { original, .. } | PackageName::Named(original) => {
+                cmd.arg("--package");
+                cmd.arg(original.as_ref());
+            },
+        }
+    }
+}
+
+impl<'a> From<&'a str> for PackageName<'a> {
+    fn from(value: &'a str) -> Self {
+        Self::Named(value.into())
+    }
+}
+
+impl<'a> From<&'a OsStr> for PackageName<'a> {
+    fn from(value: &'a OsStr) -> Self {
+        PackageName::Named(value.to_string_lossy())
+    }
+}
+
+pub struct LintCrateSpec<'a> {
+    /// See documentation for [`PackageName`]
+    package_name: PackageName<'a>,
     /// Path to lint crate
     dir: &'a Path,
 }
 
 impl<'a> LintCrateSpec<'a> {
-    pub fn new(package_name: Option<&'a str>, dir: &'a Path) -> Self {
+    pub fn new(package_name: PackageName<'a>, dir: &'a Path) -> Self {
         Self { package_name, dir }
     }
 
     /// Currently only checks for semicolons, can be extended in the future
     pub fn is_valid(&self) -> bool {
-        !self.dir.to_string_lossy().contains(';')
+        let dir_str = self.dir.to_string_lossy();
+        !dir_str.contains(';')
+            && !dir_str.contains('=')
+            && match &self.package_name {
+                PackageName::Renamed { original, new } => {
+                    !original.contains(';') && !original.contains('=') && !new.contains(';') && !new.contains('=')
+                },
+                PackageName::Named(name) => !name.contains(';') && !name.contains('='),
+            }
     }
 
     /// Creates a debug build for this crate. The path of the build library
     /// will be returned, if the operation was successful.
     pub fn build(&self, target_dir: &Path, verbose: bool) -> Result<PathBuf, ExitStatus> {
         build_local_lint_crate(self, target_dir, verbose)
+    }
+
+    /// Returns the package name of the lint crate
+    pub fn package_name(&self) -> &PackageName {
+        &self.package_name
     }
 }
 
@@ -61,10 +125,7 @@ fn build_local_lint_crate(krate: &LintCrateSpec<'_>, target_dir: &Path, verbose:
     if verbose {
         cmd.arg("--verbose");
     }
-    if let Some(name) = krate.package_name {
-        cmd.arg("--package");
-        cmd.arg(name);
-    }
+    krate.package_name.cargo_args(&mut cmd);
     let exit_status = cmd
         .current_dir(std::fs::canonicalize(krate.dir).unwrap())
         .args(["--lib", "--target-dir"])
@@ -106,4 +167,25 @@ fn build_local_lint_crate(krate: &LintCrateSpec<'_>, target_dir: &Path, verbose:
     } else {
         Ok(krate_path)
     }
+}
+
+/// Builds all crates passed in, returns the env var for the adapter, if successful.
+/// Env var looks like this:
+/// `foo=/some/path/to/lint/crate/lib;bar=/baz/lib;`
+pub fn build_all(krates: &[LintCrateSpec], target_dir: &Path, verbose: bool) -> Result<OsString, ExitStatus> {
+    let mut env_var = Vec::<OsString>::with_capacity(krates.len());
+
+    for krate in krates {
+        let mut s = OsString::new();
+        match krate.package_name() {
+            PackageName::Renamed { new, .. } => s.push(new.as_ref()),
+            PackageName::Named(name) => s.push(name.as_ref()),
+        };
+        s.push("=");
+        s.push(krate.build(target_dir, verbose)?);
+        s.push(";");
+        env_var.push(s);
+    }
+
+    Ok(env_var.join(OsStr::new(";")))
 }
